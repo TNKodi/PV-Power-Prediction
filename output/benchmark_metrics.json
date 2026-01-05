@@ -1,0 +1,41 @@
+[
+  {
+    "name": "Python Physics",
+    "n_days": 5,
+    "mae_kwh": 32.710928867106915,
+    "rmse_kwh": 37.73246667409659,
+    "mape_pct": 11.41041000435265,
+    "bias_pct": 2.7670708271164464,
+    "total_predicted_kwh": 1432.2804033708019,
+    "total_actual_kwh": 1380.526,
+    "total_error_pct": 3.7488901600405793,
+    "avg_time_ms": 0.43535277735726496,
+    "total_time_ms": 62.69079993944615
+  },
+  {
+    "name": "JS Physics",
+    "n_days": 5,
+    "mae_kwh": 41.524828999257,
+    "rmse_kwh": 50.67755617532329,
+    "mape_pct": 14.47094462573296,
+    "bias_pct": 11.547368361255396,
+    "total_predicted_kwh": 1551.3529908798778,
+    "total_actual_kwh": 1380.526,
+    "total_error_pct": 12.374050968969632,
+    "avg_time_ms": 0.015331944444444447,
+    "total_time_ms": 2.2078
+  },
+  {
+    "name": "JS Surrogate",
+    "n_days": 5,
+    "mae_kwh": 28.384493787637012,
+    "rmse_kwh": 32.30989308111446,
+    "mape_pct": 9.964781789673768,
+    "bias_pct": 2.400024054332472,
+    "total_predicted_kwh": 1425.2674902025592,
+    "total_actual_kwh": 1380.526,
+    "total_error_pct": 3.240901670997803,
+    "avg_time_ms": 0.0047083333333333335,
+    "total_time_ms": 0.678
+  }
+]

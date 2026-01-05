@@ -1,0 +1,976 @@
+#!/usr/bin/env python3
+"""
+================================================================================
+UNIFIED PHYSICS-BASED PV GENERATION MODEL
+================================================================================
+
+Production-grade Solcast → PV Generation pipeline that reproduces PVsyst physics
+and loss ordering as closely as possible using:
+
+  - Perez POA transposition (with dni_extra for accuracy)
+  - AOI + IAM from PVsyst
+  - SAPM temperature matched to PVsyst Uc/Uv
+  - Far-shading (when configured in plant_config.json)
+  - Sequential DC loss chain (PVsyst order)
+  - Plant-level inverter clipping (PVsyst methodology)
+  - AC wiring losses
+  - Correct PVsyst orientation weighting
+
+USAGE:
+------
+  # Fetch from Solcast API (forecast endpoint)
+  python physics_model.py --source api
+
+  # Fetch from Solcast API (estimated_actuals - last 7 days)
+  python physics_model.py --source api --endpoint estimated_actuals
+
+  # Read from local CSV file
+  python physics_model.py --source csv
+
+  # Read from custom CSV path
+  python physics_model.py --source csv --csv-path ../data/custom.csv
+
+  # Show help
+  python physics_model.py --help
+
+NOTE:
+-----
+Exact numerical agreement with PVsyst requires validation against the
+plant's PVsyst report and, where available, inverter efficiency curves.
+
+================================================================================
+"""
+
+import argparse
+import requests
+import pandas as pd
+import numpy as np
+import pvlib
+from pvlib.location import Location
+import sys
+import os
+import json
+from pathlib import Path
+from datetime import datetime, timedelta
+
+# =====================================================================
+# CONFIGURATION LOADER
+# =====================================================================
+
+def load_config(config_path=None):
+    """
+    Load plant configuration from JSON file.
+    
+    Args:
+        config_path: Path to config file. If None, uses default location.
+    
+    Returns:
+        dict: Plant configuration parameters
+    """
+    if config_path is None:
+        # Path: scripts/python_physics/ -> ../../config/
+        config_path = Path(__file__).parent.parent.parent / "config" / "plant_config.json"
+    
+    with open(config_path, "r") as f:
+        return json.load(f)
+
+# Load configuration
+config = load_config()
+
+# =====================================================================
+# ⚠️ CRITICAL USER INPUTS — MUST BE VERIFIED PER PLANT
+# =====================================================================
+# These parameters are NOT generic defaults.
+# They MUST be verified for EACH new solar plant.
+#
+# If ANY of the following values are incorrect or assumed without
+# validation, the generation estimate will be physically inconsistent
+# and may deviate from PVsyst by >10–30%.
+#
+# IMPORTANT:
+# PVsyst is the REFERENCE model.
+# This script is a PVsyst-consistent reimplementation, not an optimizer.
+#
+# Sources for each parameter are explicitly noted below.
+#
+# ---------------------------------------------------------------------
+# 1) Solcast API + Location
+# ---------------------------------------------------------------------
+# API_KEY:
+#   → Your own Solcast API key
+#   → Obtained from Solcast dashboard (NOT from PVsyst)
+#
+# lat, lon:
+#   → Exact plant latitude / longitude
+#   → PVsyst Simulation Report → Page 2 → "Geographical Site"
+#   → Must match the coordinates used in the PVsyst simulation
+#
+# period:
+#   → Time resolution of Solcast data
+#   → Independent of PVsyst internal timestep
+#   → Choose based on modeling intent:
+#       - "PT60M" for hourly energy modeling
+#       - "PT30M" / "PT15M" only if sub-hourly dynamics are required
+#
+# TIMEZONE:
+#   → Local plant timezone (used ONLY for labeling / reporting)
+#   → PVsyst Simulation Report → Page 2 → "Time zone"
+#   → ALL internal calculations are performed in UTC
+#
+# ---------------------------------------------------------------------
+# 2) Array Orientations (HIGH-RISK INPUT)
+# ---------------------------------------------------------------------
+# orientations:
+#   → MUST be extracted from PVsyst "Orientation" sections
+#   → Each UNIQUE (tilt, azimuth) combination is a separate entry
+#
+# For EACH orientation:
+#   - tilt (degrees):
+#       PVsyst report → "General parameters" → Orientation #n
+#
+#   - azimuth (degrees):
+#       PVsyst convention:
+#         0 = South
+#         +90 = West
+#         -90 = East
+#         ±180 = North
+#
+#   - module_count:
+#       → Derived from plant layout / as-built drawings
+#       → Count = strings × modules per string per roof/array plane
+#       → MUST satisfy:
+#           sum(module_count) == total modules reported by PVsyst
+#
+# ⚠ Do NOT guess module counts.
+# ⚠ Do NOT evenly split unless documentation is unavailable
+#    (and clearly mark as approximation).
+#
+# ---------------------------------------------------------------------
+# 3) Module Geometry & Electrical Parameters
+# ---------------------------------------------------------------------
+# module_area (m² per module):
+#   → PRIMARY source: Manufacturer datasheet / as-built drawings
+#   → Secondary cross-check: PVsyst report → "Total PV power" → Module area
+#   → PVsyst reports TOTAL module area, not per-module geometry
+#
+# module_efficiency_stc:
+#   → PVsyst report → Loss Diagram
+#       ("efficiency at STC = xx.xx% PV conversion")
+#   → This value is already PVsyst-consistent and SHOULD be used directly
+#   → NOTE: May differ slightly from datasheet (use PVsyst value for validation)
+#
+# gamma_p (power temperature coefficient):
+#   → NOT explicitly printed in the PVsyst report
+#   → Source MUST be one of:
+#       - PV module datasheet, OR
+#       - PVsyst internal module database
+#   → Typical crystalline silicon range:
+#       -0.003 to -0.004 per °C
+#
+# ---------------------------------------------------------------------
+# 4) Inverter & System-Level Parameters
+# ---------------------------------------------------------------------
+# INV_AC_RATING_KW:
+#   → PVsyst report → Page 2 → "System summary"
+#   → Use TOTAL inverter AC power (sum of all inverters): Pnom total
+#   → Value in kW for direct use with kW-based power calculations
+#
+# PDC_THRESHOLD_KW:
+#   → Inverter startup / minimum operating power (Pmin / Pthresh)
+#   → NOT numerically exposed in PVsyst simulation reports
+#   → Obtain from:
+#       - PVsyst report → Loss Diagram → "Power threshold loss"
+#       - If reported as 0.0%, set PDC_THRESHOLD_KW = 0.0
+#       - Otherwise obtain from PVsyst inverter component (.OND), OR
+#       - Manufacturer datasheet
+#
+# ---------------------------------------------------------------------
+# 5) Optical & Shading Parameters
+# ---------------------------------------------------------------------
+# albedo:
+#   → PVsyst report → Page 2 → Project settings → Albedo
+#
+# far_shading:
+#   → PVsyst report → Loss Diagram → "Far shading" or "Horizon" loss
+#   → Value = 1 - (loss % / 100)
+#   → Set to 1.0 if no shading is defined in PVsyst
+#   → Applied multiplicatively to POA irradiance BEFORE IAM
+#
+# NOTE ON SHADING / HORIZON LOSSES:
+# Apply shading factor IF PVsyst report shows:
+# - Near shading loss (from shading scene)
+# - Far shading loss (from horizon profile)
+# - Explicit shading loss percentage in Loss Diagram
+#
+# Do NOT apply shading factor if:
+# - PVsyst shows "free horizon"
+# - No shading scene is defined
+# - Only "Global incident in coll. plane" loss appears
+#   (this is transposition geometry, already in Perez)
+#
+# ---------------------------------------------------------------------
+# 6) DC-Side Loss Factors (PVsyst-derived)
+# ---------------------------------------------------------------------
+# soiling, LID, mismatch, dc_wiring, module_quality:
+#   → PVsyst report → "Array losses" section / Loss Diagram
+#   → These are ANNUAL AVERAGE losses
+#   → Applied on the DC side only
+#   → Order must remain:
+#       Soiling → LID → Module quality → Mismatch → DC wiring
+#   → module_quality is often a GAIN (negative loss), e.g., +0.8%
+#   → Extract EXACT values from PVsyst loss diagram
+#
+# ---------------------------------------------------------------------
+# 7) AC-Side Loss Factors (PVsyst-derived)
+# ---------------------------------------------------------------------
+# ac_wiring_loss:
+#   → PVsyst report → Loss Diagram → "AC ohmic loss"
+#   → Applied AFTER inverter conversion, BEFORE reporting
+#   → Typically 0.2–0.5%
+#
+# ---------------------------------------------------------------------
+# 8) IAM Table (MODULE-SPECIFIC)
+# ---------------------------------------------------------------------
+# iam_angles / iam_values:
+#   → PVsyst report → "IAM loss factor" → User-defined profile
+#   → Module-specific optical behavior
+#   → MUST NOT be reused across different module models
+#   → Interpolated against angle-of-incidence (AOI)
+#
+# ---------------------------------------------------------------------
+# 9) Thermal Model Parameters
+# ---------------------------------------------------------------------
+# sapm_params:
+#   → Chosen to approximate PVsyst thermal model (Uc / Uv)
+#   → PVsyst report → "Thermal Loss factor"
+#   → PVsyst Uc/Uv values guide SAPM mounting selection
+#   → IMPORTANT: SAPM and PVsyst use different thermal equations
+#   → Exact cell temperature match is NOT possible
+#   → Validation is performed at ANNUAL energy/PR level, not hourly
+#
+# VALIDATION RULE:
+#   If annual AC energy or PR deviates from PVsyst by >3–5%,
+#   revisit thermal model selection FIRST.
+#
+# ---------------------------------------------------------------------
+# FINAL WARNING
+# ---------------------------------------------------------------------
+# This script is NOT plug-and-play.
+# It is a PVsyst-consistent forward model.
+#
+# ALWAYS validate against PVsyst:
+#   - Annual POA irradiation
+#   - Annual DC energy (EArray)
+#   - Annual AC energy (E_Grid)
+#   - Performance Ratio (PR)
+#
+# BEFORE using outputs for BI, forecasting, or operations.
+# =====================================================================
+
+
+# =====================================================================
+# 1) PARAMETERS FROM CONFIG FILE
+# =====================================================================
+# All plant-specific parameters are loaded from config/plant_config.json
+# Modify that file for different plants - do not hardcode values here.
+
+# API & Location
+API_KEY = config["api"]["solcast_key"]
+lat = config["location"]["lat"]
+lon = config["location"]["lon"]
+period = config["api"]["period"]
+TIMEZONE = config["location"]["timezone"]
+SITE_ALTITUDE_M = config["location"]["altitude_m"]
+
+# Orientations
+orientations = config["orientations"]
+
+# Module parameters
+module_area = config["module"]["area_m2"]
+total_module_area = sum(o["module_count"] * module_area for o in orientations)
+module_efficiency_stc = config["module"]["efficiency_stc"]
+gamma_p = config["module"]["gamma_p"]
+
+# Inverter parameters
+INV_AC_RATING_KW = config["inverter"]["ac_rating_kw"]
+PDC_THRESHOLD_KW = config["inverter"]["dc_threshold_kw"]
+
+# Losses
+soiling = config["losses"]["soiling"]
+LID = config["losses"]["lid"]
+module_quality = config["losses"]["module_quality"]
+mismatch = config["losses"]["mismatch"]
+dc_wiring = config["losses"]["dc_wiring"]
+ac_wiring_loss = config["losses"]["ac_wiring"]
+albedo = config["losses"]["albedo"]
+far_shading = config["losses"].get("far_shading", 1.0)  # Default to 1.0 (no shading)
+
+# DC loss factor (computed from individual losses)
+dc_loss_factor = (1 - soiling) * (1 - LID) * (1 - module_quality) * (1 - mismatch) * (1 - dc_wiring)
+
+# IAM table
+iam_angles = np.array(config["iam"]["angles"])
+iam_values = np.array(config["iam"]["values"])
+
+# Default weather values
+DEFAULT_WIND_SPEED_MS = config["defaults"]["wind_speed_ms"]
+DEFAULT_AIR_TEMP_C = config["defaults"]["air_temp_c"]
+
+# Thermal model
+sapm_params = pvlib.temperature.TEMPERATURE_MODEL_PARAMETERS["sapm"][config["thermal_model"]]
+
+# =====================================================================
+# INVERTER EFFICIENCY MODEL (from config)
+# =====================================================================
+USE_INVERTER_CURVE = config["inverter"]["use_efficiency_curve"]
+inverter_eff_curve_kw = np.array(config["inverter"]["efficiency_curve_kw"])
+inverter_eff_curve_eta = np.array(config["inverter"]["efficiency_curve_eta"])
+FLAT_EFFICIENCY = config["inverter"]["flat_efficiency"]
+
+# Date range for Solcast data
+start_date = config["date_range"]["start"]
+end_date = config["date_range"]["end"]
+
+def inverter_efficiency(pdc_kw):
+    """
+    Returns inverter efficiency η as a function of DC power (kW).
+    Uses curve interpolation or flat efficiency based on config.
+    """
+    if USE_INVERTER_CURVE:
+        return np.interp(np.asarray(pdc_kw), inverter_eff_curve_kw, inverter_eff_curve_eta)
+    else:
+        return FLAT_EFFICIENCY
+
+
+# =====================================================================
+# 2) SOLCAST API FETCH
+# =====================================================================
+
+# NOTE TO USERS:
+# - This script supports multiple Solcast endpoints via --endpoint flag
+# - For PVsyst validation, prefer Solcast TMY if available
+# - For backtesting or SCADA comparison, use estimated_actuals endpoint
+# - Change the endpoint URL below accordingly
+#
+# IMPORTANT: estimated_actuals endpoint only provides data for LAST 7 DAYS
+# Ensure start_date and end_date fall within this window.
+#
+# If wind_speed or air_temp are unavailable in your Solcast plan,
+# the model falls back to ERA5 or constant values.
+
+def fetch_solcast_forecast(lat, lon, period, api_key):
+    """Fetch Solcast forecast data (requires paid plan for weather)."""
+    url = "https://api.solcast.com.au/data/forecast/radiation_and_weather"
+    
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "period": period,
+        "api_key": api_key,
+        "output_parameters": "ghi,dni,dhi,air_temp,wind_speed_10m",
+        "format": "json"
+    }
+    
+    print("Fetching Solcast forecast data...")
+    r = requests.get(url, params=params)
+    j = r.json()
+    
+    # If wind_speed is not allowed, retry without it
+    if "response_status" in j:
+        if j["response_status"].get("message", "").lower().startswith("invalid"):
+            print("⚠️  Weather parameters not available, retrying with irradiance only...")
+            params["output_parameters"] = "ghi,dni,dhi,air_temp"
+            r = requests.get(url, params=params)
+            j = r.json()
+    
+    return j
+
+
+def fetch_solcast_estimated_actuals(lat, lon, period, api_key):
+    """Fetch Solcast estimated actuals (last 7 days of historical data)."""
+    url = "https://api.solcast.com.au/world_radiation/estimated_actuals"
+    
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "start": start_date,
+        "end": end_date,
+        "period": period,
+        "api_key": api_key,
+        "output_parameters": "ghi,dni,dhi",  # Basic tier parameters only
+        "format": "json"
+    }
+    
+    print(f"Fetching Solcast estimated actuals from {start_date} to {end_date}...")
+    r = requests.get(url, params=params)
+    
+    if r.status_code != 200:
+        print(f"\n⚠️ API ERROR (HTTP {r.status_code}):", r.text)
+        sys.exit(1)
+    
+    return r.json()
+
+
+def solcast_to_df(j):
+    """Convert Solcast JSON response to DataFrame."""
+    # Handle different Solcast response formats
+    if "estimated_actuals" in j:
+        rows = j["estimated_actuals"]
+    elif "forecasts" in j:
+        rows = j["forecasts"]
+    elif "data" in j:
+        rows = j["data"]
+    else:
+        raise ValueError(f"Solcast API did not return valid data. Keys found: {j.keys()}")
+    
+    df = pd.DataFrame(rows)
+    
+    # Normalize column names
+    if "wind_speed_10m" in df.columns:
+        df.rename(columns={"wind_speed_10m": "wind_speed"}, inplace=True)
+    
+    # Parse timestamps
+    idx = pd.to_datetime(df["period_end"], utc=True)
+    df.index = pd.DatetimeIndex(idx)
+    
+    return df
+
+
+# =====================================================================
+# 3) ERA5 WEATHER FALLBACK
+# =====================================================================
+# ERA5 is used as a secondary fallback when Solcast API does not provide
+# air temperature or wind speed data. This provides physically consistent
+# weather data for thermal modeling instead of constant values.
+#
+# Fallback hierarchy:
+# 1. Solcast (primary) - if air_temp & wind_speed present
+# 2. ERA5 (secondary) - if Solcast missing weather, fetch from ERA5
+# 3. Constants (last resort) - if both fail, use DEFAULT values
+#
+# ERA5 Configuration:
+# - Requires cdsapi library and CDS API credentials
+# - Automatically attempts to fetch data for date range matching Solcast
+# - Spatial averaging applied for point location extraction
+
+def fetch_era5_weather(lat, lon, start_date_str, end_date_str):
+    """
+    Fetch ERA5 weather data (air temperature & wind speed) as fallback.
+    
+    Parameters:
+    -----------
+    lat, lon : float
+        Location coordinates
+    start_date_str, end_date_str : str
+        ISO 8601 date strings (UTC), e.g., "2025-12-10T00:00:00Z"
+    
+    Returns:
+    --------
+    pd.DataFrame with columns: air_temp (°C), wind_speed (m/s)
+    Index: UTC timestamps
+    
+    Returns None if ERA5 fetch fails.
+    """
+    try:
+        import cdsapi
+        import xarray as xr
+        
+        print("\n" + "="*60)
+        print("ERA5 FALLBACK ACTIVATED")
+        print("="*60)
+        print("Solcast API did not provide air_temp or wind_speed.")
+        print("Attempting to fetch from ERA5 (Copernicus CDS)...")
+        
+        # Parse date range from ISO strings
+        start_dt = pd.to_datetime(start_date_str).tz_localize(None)
+        end_dt = pd.to_datetime(end_date_str).tz_localize(None)
+        
+        OUTPUT_NETCDF = "era5_weather_temp.nc"
+        
+        # Initialize CDS API client
+        c = cdsapi.Client()
+        
+        # Determine year/month/day ranges for ERA5 request
+        if start_dt.month != end_dt.month:
+            print("⚠️  ERA5 fetch currently supports single-month ranges only")
+            return None
+
+        year = str(start_dt.year)
+        month = f"{start_dt.month:02d}"
+        
+        # Generate day list
+        days = []
+        current = start_dt
+        while current <= end_dt:
+            days.append(f"{current.day:02d}")
+            current += timedelta(days=1)
+        
+        print(f"ERA5 request: {start_dt.date()} → {end_dt.date()}")
+        print(f"Location: lat={lat}, lon={lon}")
+        
+        # Request ERA5 data
+        c.retrieve(
+            "reanalysis-era5-single-levels",
+            {
+                "product_type": "reanalysis",
+                "variable": [
+                    "2m_temperature",
+                    "10m_u_component_of_wind",
+                    "10m_v_component_of_wind",
+                ],
+                "year": year,
+                "month": month,
+                "day": days,
+                "time": [f"{h:02d}:00" for h in range(24)],
+                "area": [
+                    lat + 0.1,  # North
+                    lon - 0.1,  # West
+                    lat - 0.1,  # South
+                    lon + 0.1,  # East
+                ],
+                "format": "netcdf",
+            },
+            OUTPUT_NETCDF,
+        )
+        
+        print("ERA5 download complete. Processing...")
+        
+        # Process NetCDF to DataFrame
+        ds = xr.open_dataset(OUTPUT_NETCDF)
+        df = ds.to_dataframe().reset_index()
+        
+        # Detect time column (ERA5-safe)
+        if "time" in df.columns:
+            time_col = "time"
+        elif "valid_time" in df.columns:
+            time_col = "valid_time"
+        else:
+            raise RuntimeError(f"Cannot find time column in ERA5 data. Columns: {df.columns}")
+        
+        # Spatial averaging (lat/lon grid → point)
+        df = df.groupby(time_col, as_index=False).mean(numeric_only=True)
+        
+        # Unit conversions
+        df["air_temp"] = df["t2m"] - 273.15  # Kelvin → Celsius
+        df["wind_speed"] = np.sqrt(df["u10"]**2 + df["v10"]**2)  # m/s magnitude
+        
+        # Create final weather DataFrame
+        weather_df = (
+            df[[time_col, "air_temp", "wind_speed"]]
+            .rename(columns={time_col: "time"})
+            .set_index("time")
+            .sort_index()
+        )
+        weather_df.index = pd.to_datetime(weather_df.index, utc=True)
+        
+        # Clean up temporary file
+        if os.path.exists(OUTPUT_NETCDF):
+            os.remove(OUTPUT_NETCDF)
+        
+        print("✓ ERA5 weather data successfully retrieved")
+        print(f"  Temperature range: {weather_df['air_temp'].min():.1f}°C to {weather_df['air_temp'].max():.1f}°C")
+        print(f"  Wind speed range: {weather_df['wind_speed'].min():.1f} to {weather_df['wind_speed'].max():.1f} m/s")
+        print("="*60 + "\n")
+        
+        return weather_df
+        
+    except ImportError:
+        print("⚠️  ERA5 fallback failed: cdsapi library not installed")
+        print("   Install with: pip install cdsapi")
+        return None
+    except Exception as e:
+        print(f"⚠️  ERA5 fallback failed: {str(e)}")
+        print("   Check CDS API credentials: ~/.cdsapirc")
+        return None
+
+
+# =====================================================================
+# 4) CSV DATA LOADING
+# =====================================================================
+
+def load_csv_data(csv_path):
+    """
+    Load irradiance data from local CSV file.
+    
+    Parameters:
+    -----------
+    csv_path : str or Path
+        Path to CSV file containing irradiance data
+    
+    Returns:
+    --------
+    pd.DataFrame with DatetimeIndex (UTC) and columns: ghi, dni, dhi, [air_temp, wind_speed]
+    """
+    print(f"Loading irradiance data from CSV: {csv_path}")
+    df = pd.read_csv(csv_path)
+    
+    # Find timestamp column
+    time_col_candidates = ["time", "timestamp", "period_end", "datetime"]
+    
+    for col in time_col_candidates:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], utc=True)
+            df = df.set_index(col)
+            break
+    else:
+        raise RuntimeError("No valid timestamp column found in CSV. Expected one of: " + 
+                          ", ".join(time_col_candidates))
+    
+    # Sort & validate
+    df = df.sort_index()
+    required_cols = ["ghi", "dni", "dhi"]
+    missing = [c for c in required_cols if c not in df.columns]
+    
+    if missing:
+        raise RuntimeError(f"CSV missing required irradiance columns: {missing}")
+    
+    # Normalize wind speed column names
+    if "wind_speed" not in df.columns and "wind_speed_10m" in df.columns:
+        print("ℹ️  Using wind_speed_10m as wind_speed")
+        df["wind_speed"] = df["wind_speed_10m"]
+    
+    print(f"✓ Loaded {len(df)} records from {df.index.min()} to {df.index.max()}")
+    
+    return df
+
+
+# =====================================================================
+# 5) WEATHER DATA PROCESSING
+# =====================================================================
+
+def ensure_weather_data(df):
+    """
+    Ensure air_temp and wind_speed are present in DataFrame.
+    Uses fallback hierarchy: Solcast → ERA5 → Constants
+    
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        DataFrame with irradiance data
+    
+    Returns:
+    --------
+    pd.DataFrame with air_temp and wind_speed columns filled
+    """
+    missing_temp = "air_temp" not in df.columns
+    missing_wind = "wind_speed" not in df.columns
+    
+    if not missing_temp and not missing_wind:
+        print("✓ Weather data available (air_temp & wind_speed)")
+        return df
+    
+    print("\n" + "="*60)
+    print("WEATHER DATA MISSING")
+    print("="*60)
+    if missing_temp:
+        print("⚠️  Missing: air_temp")
+    if missing_wind:
+        print("⚠️  Missing: wind_speed")
+    print("="*60)
+    
+    # Attempt ERA5 fallback
+    era5_weather = fetch_era5_weather(lat, lon, start_date, end_date)
+    
+    if era5_weather is not None:
+        # ERA5 fetch successful - merge with irradiance data
+        print("Merging ERA5 weather data with irradiance data...")
+        
+        # Align ERA5 timestamps with irradiance (nearest neighbor merge)
+        df = df.join(era5_weather, how="left")
+        
+        # Forward-fill any remaining gaps (typical for timestamp misalignment)
+        if df["air_temp"].isna().any() or df["wind_speed"].isna().any():
+            print("⚠️  Minor timestamp gaps detected - forward filling...")
+            df["air_temp"] = df["air_temp"].ffill()
+            df["wind_speed"] = df["wind_speed"].ffill()
+        
+        print("✓ Weather data successfully integrated from ERA5")
+        
+    else:
+        # ERA5 fetch failed - fall back to constants
+        print("\n" + "="*60)
+        print("ERA5 FALLBACK FAILED")
+        print("="*60)
+        print("Falling back to constant weather values.")
+        print("⚠️  WARNING: Constant weather is NOT valid for PVsyst validation")
+        print("="*60 + "\n")
+        
+        if missing_temp:
+            print(f"ℹ️  Injecting default temperature ({DEFAULT_AIR_TEMP_C}°C)")
+            df["air_temp"] = DEFAULT_AIR_TEMP_C
+        
+        if missing_wind:
+            print(f"ℹ️  Injecting default wind speed ({DEFAULT_WIND_SPEED_MS} m/s)")
+            df["wind_speed"] = DEFAULT_WIND_SPEED_MS
+    
+    return df
+
+
+# =====================================================================
+# 6) PV MODEL (Perez POA → IAM → SAPM → DC → AC → Clipping)
+# =====================================================================
+
+def compute_pv_ac(df_weather):
+    """
+    Compute AC power output from weather data using physics-based model.
+    
+    Parameters:
+    -----------
+    df_weather : pd.DataFrame
+        DataFrame with DatetimeIndex (UTC) and columns: ghi, dni, dhi, air_temp, wind_speed
+    
+    Returns:
+    --------
+    pd.Series with AC power output in kW
+    """
+    # Create site location
+    site = Location(
+        lat,
+        lon,
+        altitude=SITE_ALTITUDE_M if SITE_ALTITUDE_M is not None else 0
+    )
+    solpos = site.get_solarposition(df_weather.index)
+    
+    plant_ac = pd.Series(0.0, index=df_weather.index)
+    
+    # Extraterrestrial radiation for Perez model accuracy
+    dni_extra = pvlib.irradiance.get_extra_radiation(df_weather.index)
+    
+    for o in orientations:
+        tilt = o["tilt"]
+        azimuth = o["azimuth"]
+        area_fraction = (o["module_count"] * module_area) / total_module_area
+        
+        # Perez POA transposition (GHI/DNI/DHI → POA)
+        irr = pvlib.irradiance.get_total_irradiance(
+            surface_tilt=tilt,
+            surface_azimuth=azimuth,
+            solar_zenith=solpos["zenith"],
+            solar_azimuth=solpos["azimuth"],
+            dni=df_weather["dni"],
+            ghi=df_weather["ghi"],
+            dhi=df_weather["dhi"],
+            dni_extra=dni_extra,
+            model="perez",
+            albedo=albedo
+        )
+        
+        poa = irr["poa_global"].clip(lower=0)
+        
+        # Apply far-shading BEFORE IAM (if configured)
+        # far_shading = 1.0 means no shading, < 1.0 means shading loss
+        if far_shading < 1.0:
+            poa = poa * far_shading
+        
+        # AOI + IAM (optical correction)
+        aoi = pvlib.irradiance.aoi(
+            tilt, azimuth,
+            solpos["zenith"], solpos["azimuth"]
+        )
+        iam = np.interp(aoi, iam_angles, iam_values)
+        poa_optical = poa * iam
+        
+        # SAPM cell temperature (uses POA BEFORE IAM, per PVsyst methodology)
+        # CRITICAL: Do NOT use poa_optical here; thermal losses depend on
+        # total absorbed irradiance, not optically corrected irradiance
+        cell_temp = pvlib.temperature.sapm_cell(
+            poa,  # POA before IAM (correct per methodology)
+            df_weather["air_temp"],
+            df_weather["wind_speed"],
+            **sapm_params
+        )
+        
+        # DC power per m² (kW/m²)
+        pdc_kwm2 = poa_optical * module_efficiency_stc / 1000
+        
+        # Apply temperature coefficient
+        pdc_kwm2_temp = pdc_kwm2 * (1 + gamma_p * (cell_temp - 25))
+        
+        # Apply DC losses (PVsyst order: soiling → LID → module quality → mismatch → DC wiring)
+        pdc_kwm2_eff = pdc_kwm2_temp * dc_loss_factor
+        
+        # Scale to orientation's total area
+        area_i = total_module_area * area_fraction
+        pdc_total_kw = pdc_kwm2_eff * area_i
+        
+        # Apply inverter DC threshold (Pmin / Pthresh)
+        if PDC_THRESHOLD_KW > 0:
+            pdc_total_kw = pdc_total_kw.where(pdc_total_kw >= PDC_THRESHOLD_KW, 0.0)
+        
+        # Convert DC → AC using inverter efficiency
+        pac_kw = pdc_total_kw * inverter_efficiency(pdc_total_kw)
+        
+        # Accumulate per-orientation AC power (clipping happens later)
+        plant_ac += pac_kw
+    
+    # Plant-level inverter clipping (AFTER orientation aggregation, per PVsyst)
+    # CRITICAL: Do NOT clip per-orientation; PVsyst clips at plant level
+    plant_ac = plant_ac.clip(upper=INV_AC_RATING_KW)
+    
+    # Apply AC wiring losses (AFTER inverter, BEFORE reporting)
+    plant_ac = plant_ac * (1 - ac_wiring_loss)
+    
+    return plant_ac
+
+
+# =====================================================================
+# 7) MAIN EXECUTION
+# =====================================================================
+
+def main():
+    """Main entry point with CLI argument parsing."""
+    parser = argparse.ArgumentParser(
+        description="Physics-based PV generation model",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python physics_model.py --source api
+  python physics_model.py --source api --endpoint estimated_actuals
+  python physics_model.py --source csv
+  python physics_model.py --source csv --csv-path ../data/custom.csv
+        """
+    )
+    
+    parser.add_argument(
+        "--source",
+        choices=["api", "csv"],
+        default="csv",
+        help="Data source: 'api' for Solcast API, 'csv' for local file (default: csv)"
+    )
+    
+    parser.add_argument(
+        "--endpoint",
+        choices=["forecast", "estimated_actuals"],
+        default="forecast",
+        help="Solcast API endpoint (default: forecast)"
+    )
+    
+    parser.add_argument(
+        "--csv-path",
+        default=str(Path(__file__).parent.parent.parent / "data" / "solcast_irradiance.csv"),
+        help="Path to CSV file when using --source csv"
+    )
+    
+    parser.add_argument(
+        "--output",
+        default=str(Path(__file__).parent.parent.parent / "output" / "pv_generation.csv"),
+        help="Output CSV path"
+    )
+    
+    args = parser.parse_args()
+    
+    print("\n" + "="*60)
+    print("PHYSICS-BASED PV GENERATION MODEL")
+    print("="*60)
+    print(f"Data source: {args.source}")
+    if args.source == "api":
+        print(f"API endpoint: {args.endpoint}")
+    else:
+        print(f"CSV path: {args.csv_path}")
+    print(f"Far-shading factor: {far_shading}")
+    print("="*60 + "\n")
+    
+    # =====================================================================
+    # LOAD DATA
+    # =====================================================================
+    
+    if args.source == "api":
+        # Fetch from Solcast API
+        if args.endpoint == "forecast":
+            raw = fetch_solcast_forecast(lat, lon, period, API_KEY)
+        else:
+            raw = fetch_solcast_estimated_actuals(lat, lon, period, API_KEY)
+        
+        # Check for API errors
+        if "forecasts" not in raw and "data" not in raw and "estimated_actuals" not in raw:
+            print("\n⚠️ API ERROR RECEIVED:")
+            print(raw)
+            sys.exit(1)
+        
+        df = solcast_to_df(raw)
+        
+    else:
+        # Load from CSV
+        df = load_csv_data(args.csv_path)
+    
+    # =====================================================================
+    # ENSURE WEATHER DATA
+    # =====================================================================
+    
+    df = ensure_weather_data(df)
+    
+    # =====================================================================
+    # TIMESTAMP VALIDATION
+    # =====================================================================
+    
+    # Ensure time index is strictly increasing
+    if not df.index.is_monotonic_increasing:
+        print("⚠️  Timestamp order issue detected – sorting index")
+        df = df.sort_index()
+    
+    # Enforce regular hourly grid if source data drifts
+    EXPECTED_FREQ = "h"
+    inferred_freq = pd.infer_freq(df.index)
+    if inferred_freq != EXPECTED_FREQ and inferred_freq != "H":
+        print(f"⚠️  Irregular timestep detected (inferred: {inferred_freq})")
+        print("   Resampling to nearest hourly timestamps")
+        df = df.resample(EXPECTED_FREQ).nearest()
+    
+    # =====================================================================
+    # COMPUTE PV OUTPUT
+    # =====================================================================
+    
+    print("\nComputing PV AC output...")
+    plant_ac = compute_pv_ac(df)
+    
+    # Compute timestep duration for energy integration
+    dt_hours = (df.index[1] - df.index[0]).total_seconds() / 3600
+    
+    # Convert to local timezone for reporting/output only
+    plant_ac_local = plant_ac.tz_convert(TIMEZONE)
+    
+    # Integrate power to energy (kWh)
+    energy = (plant_ac_local * dt_hours).sum()
+    
+    # =====================================================================
+    # SAVE OUTPUT
+    # =====================================================================
+    
+    # Ensure output directory exists
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    out = pd.DataFrame({"AC_kW": plant_ac_local})
+    out.to_csv(output_path)
+    
+    # =====================================================================
+    # RESULTS SUMMARY
+    # =====================================================================
+    
+    print("\n" + "="*60)
+    print("RESULTS")
+    print("="*60)
+    print(f"Output saved: {output_path}")
+    print(f"Total energy (kWh): {energy:.1f}")
+    print(f"Period: {df.index.min()} to {df.index.max()}")
+    print(f"Data source: {args.source}")
+    print("="*60)
+    
+    print("\nSample output (first 10 rows):")
+    print(out.head(10))
+    
+    print("\n" + "="*60)
+    print("VALIDATION CHECKLIST (compare with PVsyst report)")
+    print("="*60)
+    print("□ Annual POA irradiation (kWh/m²)")
+    print("□ Annual DC energy (EArray)")
+    print("□ Annual AC energy (E_Grid)")
+    print("□ Performance Ratio (PR)")
+    print("□ Acceptable deviation: ±2-5%")
+    print("="*60)
+    
+    return plant_ac
+
+
+if __name__ == "__main__":
+    main()
