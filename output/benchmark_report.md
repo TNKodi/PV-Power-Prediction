@@ -1,6 +1,6 @@
 # Model Benchmark Report
 
-Generated: 2026-01-05 11:11:45
+Generated: 2026-01-05 17:15:42
 
 ## Summary
 
@@ -13,8 +13,8 @@ Comparison of three PV prediction models against actual Meteocontrol generation 
 
 | Model | MAE (kWh) | MAPE (%) | Bias (%) | Total Error (%) | Avg Time (ms) |
 |-------|-----------|----------|----------|-----------------|---------------|
-| Python Physics | 32.7 | 11.4 | 2.8 | 3.7 | 0.435 |
-| JS Physics | 41.5 | 14.5 | 11.5 | 12.4 | 0.015 |
+| Python Physics | 32.7 | 11.4 | 2.8 | 3.7 | 0.421 |
+| JS Physics | 41.5 | 14.5 | 11.5 | 12.4 | 0.018 |
 | JS Surrogate | 28.4 | 10.0 | 2.4 | 3.2 | 0.005 |
 
 ## Daily Energy Comparison (kWh)

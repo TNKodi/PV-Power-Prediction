@@ -9,8 +9,8 @@
     "total_predicted_kwh": 1432.2804033708019,
     "total_actual_kwh": 1380.526,
     "total_error_pct": 3.7488901600405793,
-    "avg_time_ms": 0.43535277735726496,
-    "total_time_ms": 62.69079993944615
+    "avg_time_ms": 0.4211888889484625,
+    "total_time_ms": 60.6512000085786
   },
   {
     "name": "JS Physics",
@@ -22,8 +22,8 @@
     "total_predicted_kwh": 1551.3529908798778,
     "total_actual_kwh": 1380.526,
     "total_error_pct": 12.374050968969632,
-    "avg_time_ms": 0.015331944444444447,
-    "total_time_ms": 2.2078
+    "avg_time_ms": 0.017544444444444446,
+    "total_time_ms": 2.5264
   },
   {
     "name": "JS Surrogate",
@@ -35,7 +35,7 @@
     "total_predicted_kwh": 1425.2674902025592,
     "total_actual_kwh": 1380.526,
     "total_error_pct": 3.240901670997803,
-    "avg_time_ms": 0.0047083333333333335,
-    "total_time_ms": 0.678
+    "avg_time_ms": 0.004749305555555555,
+    "total_time_ms": 0.6839
   }
 ]

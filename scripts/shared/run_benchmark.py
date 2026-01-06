@@ -8,20 +8,28 @@ Compares three PV prediction models:
 
 Against actual Meteocontrol generation data.
 
-Usage: python run_benchmark.py
+Usage:
+  python run_benchmark.py                          # Use Solcast data (default)
+  python run_benchmark.py --data-source nasa_power --start 20251210 --end 20251215
 """
 
+import argparse
 import pandas as pd
 import numpy as np
 import subprocess
 import json
 import time
+import sys
 from pathlib import Path
 from datetime import datetime
 import matplotlib.pyplot as plt
 
 # Timezone utilities for consistent handling
 from timezone_utils import load_meteocontrol, to_local, to_utc, LOCAL_TZ
+
+# Add parent directory for nasa_power import
+sys.path.insert(0, str(Path(__file__).parent.parent / "python_physics"))
+from fetch_nasa_power import fetch_nasa_power_hourly
 
 # =====================================================================
 # CONFIGURATION
@@ -174,6 +182,51 @@ def load_meteocontrol_actual():
     return df[["day", "actual_kwh"]]
 
 
+def load_nasa_power_data(start_date, end_date):
+    """
+    Load and prepare NASA POWER hourly irradiance data.
+    
+    Parameters:
+    -----------
+    start_date : str
+        Start date in YYYYMMDD format
+    end_date : str
+        End date in YYYYMMDD format
+    
+    Returns:
+    --------
+    pd.DataFrame with weather data (same format as Solcast)
+    """
+    print(f"  Fetching NASA POWER data: {start_date} to {end_date}...")
+    
+    # Load config for location
+    config_path = PROJECT_DIR / "config" / "plant_config.json"
+    with open(config_path) as f:
+        config = json.load(f)
+    
+    lat = config["location"]["lat"]
+    lon = config["location"]["lon"]
+    
+    df = fetch_nasa_power_hourly(lat, lon, start_date, end_date)
+    
+    # Convert to standard format
+    df["period_end"] = pd.to_datetime(df["period_end"])
+    if df["period_end"].dt.tz is None:
+        df["period_end"] = df["period_end"].dt.tz_localize("UTC")
+    df = df.set_index("period_end").sort_index()
+    
+    # Rename wind column if needed
+    if "wind_speed_10m" in df.columns:
+        df = df.rename(columns={"wind_speed_10m": "wind_speed"})
+    
+    # Save to CSV for reference
+    output_path = DATA_DIR / "nasa_power_hourly.csv"
+    df.to_csv(output_path)
+    print(f"  Saved NASA POWER data to: {output_path}")
+    
+    return df
+
+
 # =====================================================================
 # METRICS CALCULATION
 # =====================================================================
@@ -212,20 +265,41 @@ def calculate_metrics(predicted, actual, name):
 # MAIN BENCHMARK
 # =====================================================================
 
-def run_benchmark():
+def run_benchmark(data_source="solcast", start_date=None, end_date=None):
+    """
+    Run benchmark comparison of all models.
+    
+    Parameters:
+    -----------
+    data_source : str
+        Data source to use: 'solcast' or 'nasa_power'
+    start_date : str
+        Start date for NASA POWER (YYYYMMDD format)
+    end_date : str
+        End date for NASA POWER (YYYYMMDD format)
+    """
     print("=" * 70)
     print("MODEL BENCHMARK COMPARISON")
     print("=" * 70)
+    print(f"Data source: {data_source}")
     
     # =====================================================================
     # LOAD DATA
     # =====================================================================
     print("\n[1/5] Loading data...")
     
-    df_weather = load_solcast_data()
+    if data_source == "nasa_power":
+        if not start_date or not end_date:
+            raise ValueError("--start and --end required for NASA POWER data source")
+        df_weather = load_nasa_power_data(start_date, end_date)
+        source_label = "NASA POWER"
+    else:
+        df_weather = load_solcast_data()
+        source_label = "Solcast"
+    
     df_actual = load_meteocontrol_actual()
     
-    print(f"  Solcast data: {len(df_weather)} hourly records")
+    print(f"  {source_label} data: {len(df_weather)} hourly records")
     print(f"  Date range: {df_weather.index.min()} to {df_weather.index.max()}")
     print(f"  Meteocontrol data: {len(df_actual)} daily records")
     
@@ -542,6 +616,51 @@ Comparison of three PV prediction models against actual Meteocontrol generation 
     return report
 
 
+def main():
+    """CLI entry point with argument parsing."""
+    parser = argparse.ArgumentParser(
+        description="Benchmark PV prediction models against actual data",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python run_benchmark.py                                           # Use Solcast data
+  python run_benchmark.py --data-source nasa_power --start 20251210 --end 20251215
+        """
+    )
+    
+    parser.add_argument(
+        "--data-source",
+        choices=["solcast", "nasa_power"],
+        default="solcast",
+        help="Data source for irradiance: 'solcast' (local CSV) or 'nasa_power' (fetch from API)"
+    )
+    
+    parser.add_argument(
+        "--start",
+        default=None,
+        help="Start date in YYYYMMDD format (required for nasa_power)"
+    )
+    
+    parser.add_argument(
+        "--end",
+        default=None,
+        help="End date in YYYYMMDD format (required for nasa_power)"
+    )
+    
+    args = parser.parse_args()
+    
+    # Validate NASA POWER arguments
+    if args.data_source == "nasa_power":
+        if not args.start or not args.end:
+            parser.error("--start and --end are required when using --data-source nasa_power")
+    
+    run_benchmark(
+        data_source=args.data_source,
+        start_date=args.start,
+        end_date=args.end
+    )
+
+
 if __name__ == "__main__":
-    run_benchmark()
+    main()
 

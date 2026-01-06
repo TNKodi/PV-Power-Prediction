@@ -30,6 +30,12 @@ USAGE:
   # Read from custom CSV path
   python physics_model.py --source csv --csv-path ../data/custom.csv
 
+  # Fetch from NASA POWER hourly (free, no API key needed)
+  python physics_model.py --source nasa_power --start 20251201 --end 20251215
+
+  # Fetch from NASA POWER daily (simplified model, quick estimates)
+  python physics_model.py --source nasa_power_daily --start 20251201 --end 20251215
+
   # Show help
   python physics_model.py --help
 
@@ -52,6 +58,9 @@ import os
 import json
 from pathlib import Path
 from datetime import datetime, timedelta
+
+# Import NASA POWER fetcher
+from fetch_nasa_power import fetch_nasa_power_hourly, fetch_nasa_power_daily
 
 # =====================================================================
 # CONFIGURATION LOADER
@@ -814,6 +823,120 @@ def compute_pv_ac(df_weather):
 
 
 # =====================================================================
+# 6b) SIMPLIFIED DAILY MODEL (for NASA POWER daily data)
+# =====================================================================
+
+def calculate_daily_energy_simple(df_daily):
+    """
+    Simplified daily energy model using daily irradiance totals.
+    
+    This is a simplified approach for quick estimates when only daily
+    irradiance data is available (e.g., NASA POWER daily endpoint).
+    
+    Less accurate than hourly model because:
+    - No hour-by-hour Perez POA transposition
+    - Uses average temperature for entire day
+    - No sub-daily inverter clipping effects
+    
+    Parameters:
+    -----------
+    df_daily : pd.DataFrame
+        Daily data with columns:
+        - ghi_kwh_m2_day: Daily GHI in kWh/m²/day
+        - dhi_kwh_m2_day: Daily DHI in kWh/m²/day
+        - dni_kwh_m2_day: Daily DNI in kWh/m²/day
+        - temp_c_daily: Daily average temperature in °C
+        - wind_mps_daily: Daily average wind speed in m/s
+    
+    Returns:
+    --------
+    pd.Series with daily AC energy output in kWh
+    """
+    print("\n" + "="*60)
+    print("SIMPLIFIED DAILY MODEL")
+    print("="*60)
+    
+    # System parameters from config
+    total_module_area = sum(o["module_count"] for o in orientations) * module_area
+    
+    # Average POA factor (ratio of POA irradiance to GHI for tilted arrays)
+    # This is a simplification - actual value depends on tilt, azimuth, and season
+    # For tropical locations with multiple orientations, 1.0-1.1 is typical
+    avg_poa_factor = 1.05
+    
+    # System efficiency (simplified)
+    # Includes: module efficiency, temperature losses, DC losses, inverter losses, AC losses
+    temp_ref = 25.0
+    temp_coeff = config["module"]["gamma_p"]  # Typically -0.0034
+    
+    # Daily losses (product of individual loss factors)
+    loss_factors = [
+        1 - config["losses"]["soiling"],
+        1 - config["losses"]["lid"],
+        1 + config["losses"]["module_quality"],  # Can be positive (quality gain)
+        1 - config["losses"]["mismatch"],
+        1 - config["losses"]["dc_wiring"],
+        1 - config["losses"]["ac_wiring"],
+        config["losses"]["far_shading"],
+    ]
+    dc_loss_factor = 1.0
+    for f in loss_factors:
+        dc_loss_factor *= f
+    
+    # Module STC efficiency
+    module_eff = config["module"]["efficiency_stc"]
+    
+    # Inverter efficiency (simplified flat value)
+    inv_eff = config["inverter"]["flat_efficiency"]
+    
+    # Calculate daily energy for each day
+    daily_energy = []
+    
+    for idx, row in df_daily.iterrows():
+        # Get irradiance (kWh/m²/day)
+        ghi = row.get("ghi_kwh_m2_day", 0)
+        
+        # Skip invalid days
+        if pd.isna(ghi) or ghi <= 0:
+            daily_energy.append(np.nan)
+            continue
+        
+        # Estimate POA irradiance (kWh/m²/day)
+        poa_daily = ghi * avg_poa_factor
+        
+        # Temperature correction
+        temp = row.get("temp_c_daily", temp_ref)
+        if pd.isna(temp):
+            temp = temp_ref
+        temp_factor = 1 + temp_coeff * (temp - temp_ref)
+        
+        # DC energy before losses (kWh)
+        dc_energy = poa_daily * total_module_area * module_eff * temp_factor
+        
+        # Apply DC losses
+        dc_energy_net = dc_energy * dc_loss_factor
+        
+        # Apply inverter efficiency
+        ac_energy = dc_energy_net * inv_eff
+        
+        # Apply inverter clipping (daily energy cap = 24h * AC rating)
+        max_daily_energy = INV_AC_RATING_KW * 24
+        ac_energy = min(ac_energy, max_daily_energy)
+        
+        daily_energy.append(ac_energy)
+    
+    result = pd.Series(daily_energy, index=df_daily.index, name="energy_kWh")
+    
+    print(f"Total days: {len(df_daily)}")
+    print(f"Valid days: {result.notna().sum()}")
+    print(f"Total energy: {result.sum():.1f} kWh")
+    print(f"Average daily: {result.mean():.1f} kWh")
+    print("="*60)
+    
+    return result
+
+
+# =====================================================================
 # 7) MAIN EXECUTION
 # =====================================================================
 
@@ -833,9 +956,10 @@ Examples:
     
     parser.add_argument(
         "--source",
-        choices=["api", "csv"],
+        choices=["api", "csv", "nasa_power", "nasa_power_daily"],
         default="csv",
-        help="Data source: 'api' for Solcast API, 'csv' for local file (default: csv)"
+        help="Data source: 'api' for Solcast API, 'csv' for local file, "
+             "'nasa_power' for NASA POWER hourly, 'nasa_power_daily' for daily (default: csv)"
     )
     
     parser.add_argument(
@@ -852,6 +976,18 @@ Examples:
     )
     
     parser.add_argument(
+        "--start",
+        default=None,
+        help="Start date in YYYYMMDD format (for NASA POWER)"
+    )
+    
+    parser.add_argument(
+        "--end",
+        default=None,
+        help="End date in YYYYMMDD format (for NASA POWER)"
+    )
+    
+    parser.add_argument(
         "--output",
         default=str(Path(__file__).parent.parent.parent / "output" / "pv_generation.csv"),
         help="Output CSV path"
@@ -865,8 +1001,10 @@ Examples:
     print(f"Data source: {args.source}")
     if args.source == "api":
         print(f"API endpoint: {args.endpoint}")
-    else:
+    elif args.source == "csv":
         print(f"CSV path: {args.csv_path}")
+    elif args.source in ["nasa_power", "nasa_power_daily"]:
+        print(f"NASA POWER dates: {args.start} to {args.end}")
     print(f"Far-shading factor: {far_shading}")
     print("="*60 + "\n")
     
@@ -888,6 +1026,62 @@ Examples:
             sys.exit(1)
         
         df = solcast_to_df(raw)
+    
+    elif args.source == "nasa_power":
+        # Fetch hourly data from NASA POWER (W/m², same units as Solcast)
+        if not args.start or not args.end:
+            print("⚠️ ERROR: --start and --end required for NASA POWER source")
+            print("   Example: --start 20251201 --end 20251215")
+            sys.exit(1)
+        
+        df = fetch_nasa_power_hourly(lat, lon, args.start, args.end)
+        
+        # Rename columns to match expected format
+        df = df.rename(columns={"wind_speed": "wind_speed_10m"})
+        
+        # Set index to period_end
+        df["period_end"] = pd.to_datetime(df["period_end"])
+        df = df.set_index("period_end")
+        
+        # Rename for compatibility
+        if "wind_speed_10m" in df.columns:
+            df = df.rename(columns={"wind_speed_10m": "wind_speed"})
+    
+    elif args.source == "nasa_power_daily":
+        # Fetch daily data from NASA POWER and use simplified model
+        if not args.start or not args.end:
+            print("⚠️ ERROR: --start and --end required for NASA POWER source")
+            print("   Example: --start 20251201 --end 20251215")
+            sys.exit(1)
+        
+        df_daily = fetch_nasa_power_daily(lat, lon, args.start, args.end)
+        
+        # Use simplified daily model
+        daily_energy = calculate_daily_energy_simple(df_daily)
+        
+        # Convert to local timezone for output
+        daily_energy_local = daily_energy.tz_localize(TIMEZONE)
+        
+        # Save output
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        out = pd.DataFrame({"energy_kWh": daily_energy_local})
+        out.to_csv(output_path)
+        
+        # Results summary
+        print("\n" + "="*60)
+        print("RESULTS (DAILY SIMPLIFIED MODEL)")
+        print("="*60)
+        print(f"Output saved: {output_path}")
+        print(f"Total energy (kWh): {daily_energy.sum():.1f}")
+        print(f"Period: {df_daily.index.min()} to {df_daily.index.max()}")
+        print("="*60)
+        
+        print("\nDaily energy output:")
+        print(out)
+        
+        return daily_energy
         
     else:
         # Load from CSV
