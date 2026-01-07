@@ -3,7 +3,7 @@
   "description": "Sample configuration - modify for your specific plant",
   
   "api": {
-    "solcast_key": "YOUR_SOLCAST_API_KEY",
+    "solcast_key": "2qtVZAyU-ybH99YGHy3bRUxQK_3zO58S",
     "period": "PT60M"
   },
   
