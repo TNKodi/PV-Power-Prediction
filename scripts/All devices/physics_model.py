@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 """
 ================================================================================
 UNIFIED PHYSICS-BASED PV GENERATION MODEL
